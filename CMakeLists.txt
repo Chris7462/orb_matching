@@ -32,7 +32,8 @@ ament_target_dependencies(orb_matching_node PUBLIC
   cv_bridge)
 
 target_link_libraries(orb_matching_node PUBLIC
-  opencv_core)
+  opencv_core
+  opencv_features2d)  # ${OpenCV_LIBS}
 
 install(TARGETS orb_matching_node
   DESTINATION lib/${PROJECT_NAME})

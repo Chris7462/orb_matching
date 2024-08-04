@@ -1,5 +1,5 @@
-// OpenCV header
-#include <opencv2/core.hpp>
+// C++ header
+#include <chrono>
 
 // ROS header
 #include <cv_bridge/cv_bridge.h>
@@ -10,6 +10,7 @@
 
 namespace orb_matching
 {
+using namespace std::chrono_literals;
 
 OrbMatching::OrbMatching()
 : Node("orb_matching_node")
@@ -23,87 +24,112 @@ OrbMatching::OrbMatching()
     "kitti/camera/color/right/image_raw", qos, std::bind(
       &OrbMatching::img_right_callback, this, std::placeholders::_1));
 
-//yolo_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-//  "yolo_object_detection", qos);
+  img_match_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+    "orb_matching/img_match", qos);
 
-//timer_ = this->create_wall_timer(
-//  25ms, std::bind(&YoloObjectDetection::timer_callback, this));
+  timer_ = this->create_wall_timer(
+    25ms, std::bind(&OrbMatching::timer_callback, this));
+
+  detector_ = cv::ORB::create();
+  descriptor_ = cv::ORB::create();
+  matcher_ = cv::DescriptorMatcher::create("BruteForce-Hamming");
 }
 
 void OrbMatching::img_left_callback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mtx_);
   img_left_buff_.push(msg);
-  RCLCPP_INFO(get_logger(), "Receive left");
 }
 
 void OrbMatching::img_right_callback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mtx_);
   img_right_buff_.push(msg);
-  RCLCPP_INFO(get_logger(), "Receive right");
 }
 
-//void YoloObjectDetection::timer_callback()
-//{
-//  if (!img_buff_.empty()) {
-//    rclcpp::Time current_time = rclcpp::Node::now();
-//    mtx_.lock();
-//    if ((current_time - rclcpp::Time(img_buff_.front()->header.stamp)).seconds() > 0.1) {
-//      // time sync has problem
-//      RCLCPP_WARN(get_logger(), "Timestamp unaligned, please check your IMAGE data.");
-//      img_buff_.pop();
-//      mtx_.unlock();
-//    } else {
-//      auto input_msg = img_buff_.front();
-//      img_buff_.pop();
-//      mtx_.unlock();
+cv::Mat OrbMatching::get_image_from_msg(const sensor_msgs::msg::Image::ConstSharedPtr msg)
+{
+  cv_bridge::CvImageConstPtr ptr;
+  try {
+    ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+  } catch (cv_bridge::Exception& e) {
+    RCLCPP_ERROR(get_logger(), "cv_bridge exeception: %s", e.what());
+  }
+  return ptr->image;
+}
 
-//      try {
-//        cv::Mat cv_image = cv_bridge::toCvCopy(input_msg, "bgr8")->image;
+void OrbMatching::timer_callback()
+{
+  cv::Mat img_left, img_right;
+  if (!img_left_buff_.empty() && !img_right_buff_.empty()) {
+    mtx_.lock();
+    double left_time = rclcpp::Time(img_left_buff_.front()->header.stamp).seconds();
+    double right_time = rclcpp::Time(img_right_buff_.front()->header.stamp).seconds();
 
-//        // Inference starts here...
-//        std::vector<yolo::Detection> detections = inference_.runInference(cv_image);
+    // sync tolerance
+    if (left_time < right_time - 0.015) {
+      img_left_buff_.pop();
+      RCLCPP_INFO_STREAM(get_logger(), "Throw left image --- Sync error: " << (left_time - right_time));
+      mtx_.unlock();
+    } else if (left_time > right_time + 0.015) {
+      img_right_buff_.pop();
+      RCLCPP_INFO_STREAM(get_logger(), "Throw right image --- Sync error: " << (left_time - right_time));
+      mtx_.unlock();
+    } else {
+      img_left = get_image_from_msg(img_left_buff_.front());
+      img_right = get_image_from_msg(img_right_buff_.front());
+      img_left_buff_.pop();
+      img_right_buff_.pop();
+      mtx_.unlock();
 
-//        // size_t detection_size = detections.size();
-//        // std::cout << "Number of detections:" << detection_size << std::endl;
+      if (!img_left.empty() && !img_right.empty()) {
+        // detect Oriented FAST
+        rclcpp::Time start = rclcpp::Node::now();
+        detector_->detect(img_left, keypoints_left_);
+        detector_->detect(img_right, keypoints_right_);
 
-//        for (const auto & detection : detections) {
-//          auto box = detection.box;
-//          auto class_id = detection.class_id;
-//          auto color = colors[class_id % colors.size()];
+        // compute BRIEF descriptor
+        descriptor_->compute(img_left, keypoints_left_, descriptors_left_);
+        descriptor_->compute(img_right, keypoints_right_, descriptors_right_);
+        rclcpp::Time end = rclcpp::Node::now();
+        RCLCPP_INFO(get_logger(), "Extract ORB cost = %f seconds.", (end-start).seconds());
 
-//          // Detection box
-//          cv::rectangle(cv_image, box, color, 2);
+        // use Hamming distance to match the features
+        std::vector<cv::DMatch> matches;
+        start = rclcpp::Node::now();
+        matcher_->match(descriptors_left_, descriptors_right_, matches);
+        end = rclcpp::Node::now();
+        RCLCPP_INFO(get_logger(), "Match ORB cost = %f seconds.", (end-start).seconds());
 
-//          // Detection box text
-//          std::string class_string = detection.className + ' ' + std::to_string(detection.confidence).substr(0, 4);
-//          //  cv::Size text_size = cv::getTextSize(class_string, cv::FONT_HERSHEY_DUPLEX, 1, 2, 0);
-//          //  cv::Rect text_box(box.x, box.y - 40, text_size.width + 10, text_size.height + 20);
+        // sort and remove the outliers
+        // min and max distance
+        auto min_max = std::minmax_element(matches.begin(), matches.end(),
+          [](const cv::DMatch &m_left, const cv::DMatch &m_right) {
+            return m_left.distance < m_right.distance;
+          });
+        double min_dist = min_max.first->distance;
+        // double max_dist = min_max.second->distance;
 
-//          //  cv::rectangle(cv_image, text_box, color, cv::FILLED);
-//          //  cv::putText(cv_image, class_string, cv::Point(box.x + 5, box.y - 10),
-//          //    cv::FONT_HERSHEY_DUPLEX, 1, cv::Scalar(0, 0, 0), 2, 0);
-//          cv::rectangle(
-//            cv_image, cv::Point(box.x, box.y - 10.0),
-//            cv::Point(box.x + box.width, box.y), color, cv::FILLED);
-//          cv::putText(
-//            cv_image, class_string, cv::Point(box.x, box.y - 5.0),
-//            cv::FONT_HERSHEY_SIMPLEX, 0.25, cv::Scalar(0.0, 0.0, 0.0));
-//        }
-//        // Inference ends here...
+        // remove the bad matching
+        std::vector<cv::DMatch> good_matches;
+        for (int i = 0; i < descriptors_left_.rows; ++i) {
+          if (matches[i].distance <= std::max(2 * min_dist, 30.0)) {
+            good_matches.push_back(matches[i]);
+          }
+        }
 
-//        // Convert OpenCV image to ROS Image message
-//        auto out_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", cv_image).toImageMsg();
-//        out_msg->header.frame_id = "cam2_link";
-//        out_msg->header.stamp = current_time;
-//        yolo_pub_->publish(*out_msg);
+        // publish the results
+        cv::Mat img_goodmatch;
+        cv::drawMatches(img_left, keypoints_left_, img_right, keypoints_right_, good_matches, img_goodmatch);
+        cv_bridge::CvImage cv_img_good;
+        cv_img_good.image = img_goodmatch;
+        cv_img_good.encoding = "bgr8";
 
-//      } catch (cv_bridge::Exception & e) {
-//        RCLCPP_ERROR(get_logger(), "CV_Bridge exception: %s", e.what());
-//      }
-//    }
-//  }
-//}
+        auto img_good_msg = cv_img_good.toImageMsg();
+        img_match_pub_->publish(*img_good_msg);
+      }
+    }
+  }
+}
 
 } // namespace yolo_object_detection
