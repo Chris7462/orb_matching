@@ -1,10 +1,10 @@
-#include <cstdio>
+#include "orb_matching/orb_matching.hpp"
+
 
 int main(int argc, char ** argv)
 {
-  (void) argc;
-  (void) argv;
-
-  printf("hello world orb_matching package\n");
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<orb_matching::OrbMatching>());
+  rclcpp::shutdown();
   return 0;
 }

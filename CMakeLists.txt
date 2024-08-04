@@ -10,15 +10,38 @@ find_package(ament_cmake REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(OpenCV REQUIRED)
 
-add_executable(orb_matching_node src/orb_matching_node.cpp)
+add_executable(orb_matching_node
+  src/orb_matching_node.cpp
+  src/orb_matching.cpp)
+
 target_include_directories(orb_matching_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:include>
+  ${OpenCV_INCLUDE_DIRS})
+
 target_compile_features(orb_matching_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+
+ament_target_dependencies(orb_matching_node PUBLIC
+  rclcpp
+  sensor_msgs
+  cv_bridge)
+
+target_link_libraries(orb_matching_node PUBLIC
+  opencv_core)
 
 install(TARGETS orb_matching_node
   DESTINATION lib/${PROJECT_NAME})
+
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME})
+
+install(DIRECTORY rviz
+  DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
